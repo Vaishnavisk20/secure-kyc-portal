@@ -1,4 +1,4 @@
-# Aadhaar & PAN KYC Demo (Flask)
+# Aadhaar & PAN KYC  (Flask)
 
 An end-to-end KYC flow supporting both Aadhaar and PAN cards: user details form, document upload + OCR, live selfie + face match, and risk assessment with rule-based decision (approve / manual / reject).
 
