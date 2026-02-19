@@ -62,3 +62,43 @@ An end-to-end KYC flow supporting both Aadhaar and PAN cards: user details form,
 
 ## Notes on performance
 - DeepFace on CPU can be slow; first call downloads weights. For faster runs, use a GPU-enabled environment or switch to a lighter DeepFace model/detector (e.g., Facenet512 + opencv) and retune thresholds.
+
+## ML Model & Training
+
+- The repository now includes a small example training script at `ml/train_model.py` and a placeholder model artifact at `ml/risk_model.pkl`.
+
+- Purpose: `services/risk_model.py` will attempt to load `ml/risk_model.pkl` at startup. If the file is missing the service falls back to a rule-based heuristic implementation (this is intentional and safe for development).
+
+- The provided `ml/train_model.py` generates synthetic training data, trains a small RandomForest classifier, and saves the artifact to `ml/risk_model.pkl`. This placeholder model is intended for local testing and demonstration only.
+
+### How to retrain a production model
+
+1. Replace the synthetic data generator in `ml/train_model.py` with your labeled KYC dataset. The expected feature order used by `services/risk_model.py` is:
+
+   - `face_pct` (0-100)
+   - `name_pct` (0-100)
+   - `verhoeff_flag` (0 or 1)
+   - `blur_score` (numeric)
+
+2. Train and save a scikit-learn compatible estimator with `joblib.dump()` to `ml/risk_model.pkl`.
+
+3. Restart the Flask app; `services/risk_model.py` will automatically load the model if present.
+
+### Quick commands (local)
+
+```bash
+# Install deps
+pip install -r requirements.txt
+
+# Train and save placeholder model (creates ml/risk_model.pkl)
+python ml/train_model.py
+
+# Run the app
+python app.py
+```
+
+### Security & production notes
+
+- Do NOT commit real production model artifacts containing sensitive training data. Use an artifacts store (S3, Artifactory, MLflow) and fetch the model during deploy.
+- The example model here is synthetic and for local testing only. Replace with a properly validated, versioned model before using in production.
+- Logging, model versioning, and monitoring should be added when moving to production (CI, model registry, A/B testing and rollback).
