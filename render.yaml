@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: secure-kyc-portal
+    env: docker
+    plan: standard
+    autoDeploy: true
+    healthCheckPath: /
+    envVars:
+      - key: KYC_SECRET_KEY
+        generateValue: true
+      - key: KYC_DEBUG
+        value: "0"
+      - key: KYC_FACE_MODEL
+        value: ArcFace
+      - key: KYC_FACE_DETECTOR
+        value: retinaface
+      - key: KYC_FACE_APPROVE_THRESHOLD
+        value: "0.75"
+      - key: KYC_FACE_MANUAL_THRESHOLD
+        value: "0.90"
