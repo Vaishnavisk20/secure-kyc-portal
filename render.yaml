@@ -2,7 +2,7 @@ services:
   - type: web
     name: secure-kyc-portal
     env: docker
-    plan: standard
+    plan: free
     autoDeploy: true
     healthCheckPath: /
     envVars:
