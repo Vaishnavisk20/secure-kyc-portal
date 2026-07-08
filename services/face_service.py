@@ -7,8 +7,8 @@ import tempfile
 MODEL_NAME = os.getenv("KYC_FACE_MODEL", "ArcFace")
 DETECTOR_BACKEND = os.getenv("KYC_FACE_DETECTOR", "retinaface")
 DISTANCE_METRIC = os.getenv("KYC_FACE_METRIC", "cosine")
-APPROVE_THRESHOLD = float(os.getenv("KYC_FACE_APPROVE_THRESHOLD", "0.75"))
-MANUAL_THRESHOLD = float(os.getenv("KYC_FACE_MANUAL_THRESHOLD", "0.90"))
+APPROVE_SCORE_THRESHOLD = float(os.getenv("KYC_FACE_APPROVE_SCORE", "70"))
+MANUAL_SCORE_THRESHOLD = float(os.getenv("KYC_FACE_MANUAL_SCORE", "50"))
 
 
 def image_orientations(image):
@@ -96,23 +96,23 @@ def verify_face_match(id_card_image, selfie_image):
                 best_candidate = candidate_type
 
         distance = best_result['distance']
-        if distance <= APPROVE_THRESHOLD:
+        accuracy_score = round(max(0, min(100, (1 - distance) * 100)), 2)
+
+        if accuracy_score >= APPROVE_SCORE_THRESHOLD:
             decision = "APPROVED"
             is_match = True
-        elif distance <= MANUAL_THRESHOLD:
+        elif accuracy_score >= MANUAL_SCORE_THRESHOLD:
             decision = "MANUAL_REVIEW"
             is_match = False
         else:
             decision = "REJECTED"
             is_match = False
-        
-        accuracy_score = round((1 - distance) * 100, 2)
 
         print(
             f"✅ Face Result: Decision={decision}, Match={is_match}, Dist={distance}, "
             f"Score={accuracy_score}%, Model={MODEL_NAME}, "
-            f"Detector={DETECTOR_BACKEND}, ApproveThreshold={APPROVE_THRESHOLD}, "
-            f"ManualThreshold={MANUAL_THRESHOLD}, Orientation={best_orientation}, "
+            f"Detector={DETECTOR_BACKEND}, ApproveScoreThreshold={APPROVE_SCORE_THRESHOLD}, "
+            f"ManualScoreThreshold={MANUAL_SCORE_THRESHOLD}, Orientation={best_orientation}, "
             f"Candidate={best_candidate}"
         )
 
@@ -126,9 +126,9 @@ def verify_face_match(id_card_image, selfie_image):
             "metric": DISTANCE_METRIC,
             "orientation": best_orientation,
             "candidate": best_candidate,
-            "approve_threshold": APPROVE_THRESHOLD,
-            "manual_threshold": MANUAL_THRESHOLD,
-            "error": None if is_match else f"Distance {distance:.3f} needs {decision.replace('_', ' ').lower()}"
+            "approve_threshold": APPROVE_SCORE_THRESHOLD,
+            "manual_threshold": MANUAL_SCORE_THRESHOLD,
+            "error": None if is_match else f"Similarity {accuracy_score}% needs {decision.replace('_', ' ').lower()}"
         }
 
     except Exception as e:

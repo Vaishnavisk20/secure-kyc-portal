@@ -14,7 +14,7 @@ An end-to-end KYC flow supporting both Aadhaar and PAN cards: user details form,
 - PAN number: if provided and mismatched → reject; if provided but not detected → reject.
 - DOB: if provided and mismatched → reject; if provided but missing in OCR → reject.
 - Name: fuzzy score < 50 → reject; < 70 → manual; else OK.
-- Face: distance < 0.40 → reject; < 0.60 → manual; else OK (Facenet model).
+- Face: similarity score >= 70 → approve; >= 50 → manual review; below 50 → reject.
 - OCR status: must be `CONFIRMED` to auto-pass; otherwise manual.
 - Risk score: > 0.7 → reject; > 0.5 → manual; else OK.
 
@@ -39,6 +39,7 @@ An end-to-end KYC flow supporting both Aadhaar and PAN cards: user details form,
    python app.py
    ```
 4) Open http://127.0.0.1:5000 and follow the multi-page KYC flow:
+   - Login: `admin` / `admin123` by default.
    - Page 1: Enter user details (Name, DOB, Aadhaar last4, PAN number).
    - Page 2: Upload Aadhaar and PAN documents.
    - Page 3: Capture live selfie for face verification.
@@ -93,10 +94,40 @@ Copy `.env.example` and set production values:
 
 - `KYC_SECRET_KEY` - required, use a long random secret.
 - `KYC_DEBUG=0` - hides debug OCR/model details in production.
+- `KYC_LOGIN_USERNAME` - portal login username, defaults to `admin`.
+- `KYC_LOGIN_PASSWORD` - portal login password, defaults to `admin123`; change this in production.
+- `KYC_PUBLIC_URL` - public base URL used for OAuth callbacks, for example `https://secure-kyc-portal.onrender.com`.
+- `KYC_GOOGLE_CLIENT_ID` / `KYC_GOOGLE_CLIENT_SECRET` - enables Google login.
+- `KYC_GITHUB_CLIENT_ID` / `KYC_GITHUB_CLIENT_SECRET` - enables GitHub login.
+- `KYC_DIGILOCKER_CLIENT_ID` / `KYC_DIGILOCKER_CLIENT_SECRET` - enables DigiLocker document KYC.
+- `KYC_DIGILOCKER_AUTH_URL` / `KYC_DIGILOCKER_TOKEN_URL` - DigiLocker OAuth URLs assigned to your app.
+- `KYC_DIGILOCKER_PROFILE_URL` - optional DigiLocker profile/eKYC endpoint used to fetch verified identity fields.
+- `KYC_DIGILOCKER_SCOPE` - DigiLocker OAuth scopes, defaults to `openid profile`.
 - `KYC_DB_PATH` - SQLite database location.
 - `KYC_UPLOAD_FOLDER` - uploaded document location.
 - `KYC_FACE_MODEL` - defaults to `ArcFace`.
 - `KYC_FACE_DETECTOR` - defaults to `retinaface`.
+- `KYC_FACE_APPROVE_SCORE` - minimum displayed similarity score for approval, defaults to `70`.
+- `KYC_FACE_MANUAL_SCORE` - minimum displayed similarity score for manual review, defaults to `50`.
+
+### OAuth Login
+
+The app supports Google and GitHub login in addition to the local admin login. Create OAuth apps with these callback URLs:
+
+- Local Google: `http://127.0.0.1:5000/oauth/google/callback`
+- Local GitHub: `http://127.0.0.1:5000/oauth/github/callback`
+- Render Google: `https://secure-kyc-portal.onrender.com/oauth/google/callback`
+- Render GitHub: `https://secure-kyc-portal.onrender.com/oauth/github/callback`
+- Local DigiLocker: `http://127.0.0.1:5000/digilocker/callback`
+- Render DigiLocker: `https://secure-kyc-portal.onrender.com/digilocker/callback`
+
+After you create the OAuth app, set the matching Client ID and Client Secret environment variables. The login buttons appear only for providers that have both values configured.
+
+### DigiLocker KYC
+
+The document step includes a DigiLocker option. With approved DigiLocker/API Setu credentials, the app redirects the user to DigiLocker, exchanges the callback code for an access token, fetches verified identity data from the configured profile/eKYC endpoint, and then continues to the existing live face capture step.
+
+If the configured DigiLocker profile response includes a base64 face photo in fields such as `photo`, `picture`, `photo_base64`, `aadhaar_photo`, or `jpg_image`, the app uses it as the reference image for face matching. If no photo is returned, the app asks for a one-time Aadhaar image upload so live capture still has an ID face to compare against.
 
 ### Persistence Warning
 

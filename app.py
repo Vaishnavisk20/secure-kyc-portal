@@ -2,17 +2,23 @@ import os
 import cv2
 import base64
 import html
+import json
 import time
+import secrets
+import urllib.error
+import urllib.parse
+import urllib.request
 import numpy as np
 import fitz  # PyMuPDF for PDF handling
-from flask import Flask, request, session, redirect, jsonify
+from flask import Flask, request, session, redirect, jsonify, url_for
+from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
 # --- IMPORT SERVICES ---
 # Ensure you have services/ocr_service.py and services/face_service.py
 from services.ocr_service import extract_aadhaar_text, extract_pan_text
 from services.face_service import verify_face_match
-from services.db_service import create_kyc_record, init_db
+from services.db_service import create_kyc_record, create_user, find_user_by_email, init_db
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("KYC_SECRET_KEY", "secure-kyc-key-999")
@@ -20,6 +26,19 @@ app.config['MAX_CONTENT_LENGTH'] = int(os.getenv("KYC_MAX_UPLOAD_MB", "16")) * 1
 
 UPLOAD_FOLDER = os.getenv("KYC_UPLOAD_FOLDER", "static/uploads")
 DEBUG_KYC = os.getenv("KYC_DEBUG", "1") == "1"
+LOGIN_USERNAME = os.getenv("KYC_LOGIN_USERNAME", "admin")
+LOGIN_PASSWORD = os.getenv("KYC_LOGIN_PASSWORD", "admin123")
+GOOGLE_CLIENT_ID = os.getenv("KYC_GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("KYC_GOOGLE_CLIENT_SECRET")
+GITHUB_CLIENT_ID = os.getenv("KYC_GITHUB_CLIENT_ID")
+GITHUB_CLIENT_SECRET = os.getenv("KYC_GITHUB_CLIENT_SECRET")
+PUBLIC_URL = os.getenv("KYC_PUBLIC_URL")
+DIGILOCKER_CLIENT_ID = os.getenv("KYC_DIGILOCKER_CLIENT_ID")
+DIGILOCKER_CLIENT_SECRET = os.getenv("KYC_DIGILOCKER_CLIENT_SECRET")
+DIGILOCKER_AUTH_URL = os.getenv("KYC_DIGILOCKER_AUTH_URL")
+DIGILOCKER_TOKEN_URL = os.getenv("KYC_DIGILOCKER_TOKEN_URL")
+DIGILOCKER_PROFILE_URL = os.getenv("KYC_DIGILOCKER_PROFILE_URL")
+DIGILOCKER_SCOPE = os.getenv("KYC_DIGILOCKER_SCOPE", "openid profile")
 ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "pdf"}
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 init_db()
@@ -40,6 +59,190 @@ def allowed_image_file(filename):
 def upload_path(prefix, filename):
     safe_name = secure_filename(filename or "upload")
     return os.path.join(UPLOAD_FOLDER, f"{prefix}_{int(time.time() * 1000)}_{safe_name}")
+
+
+def is_logged_in():
+    return session.get("logged_in") is True
+
+
+def require_login():
+    if not is_logged_in():
+        return redirect("/login")
+    return None
+
+
+OAUTH_PROVIDERS = {
+    "google": {
+        "label": "Google",
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
+        "token_url": "https://oauth2.googleapis.com/token",
+        "userinfo_url": "https://openidconnect.googleapis.com/v1/userinfo",
+        "scope": "openid email profile",
+    },
+    "github": {
+        "label": "GitHub",
+        "client_id": GITHUB_CLIENT_ID,
+        "client_secret": GITHUB_CLIENT_SECRET,
+        "auth_url": "https://github.com/login/oauth/authorize",
+        "token_url": "https://github.com/login/oauth/access_token",
+        "userinfo_url": "https://api.github.com/user",
+        "emails_url": "https://api.github.com/user/emails",
+        "scope": "read:user user:email",
+    },
+}
+
+
+def get_provider(provider):
+    config = OAUTH_PROVIDERS.get(provider)
+    if not config:
+        return None
+    return config
+
+
+def provider_is_configured(provider):
+    config = get_provider(provider)
+    return bool(config and config.get("client_id") and config.get("client_secret"))
+
+
+def callback_url(provider):
+    path = url_for("oauth_callback", provider=provider)
+    if PUBLIC_URL:
+        return f"{PUBLIC_URL.rstrip('/')}{path}"
+    return url_for("oauth_callback", provider=provider, _external=True)
+
+
+def digilocker_callback_url():
+    path = url_for("digilocker_callback")
+    if PUBLIC_URL:
+        return f"{PUBLIC_URL.rstrip('/')}{path}"
+    return url_for("digilocker_callback", _external=True)
+
+
+def digilocker_is_configured():
+    return bool(DIGILOCKER_CLIENT_ID and DIGILOCKER_CLIENT_SECRET and DIGILOCKER_AUTH_URL and DIGILOCKER_TOKEN_URL)
+
+
+def post_form_json(url, data, headers=None):
+    body = urllib.parse.urlencode(data).encode("utf-8")
+    request_obj = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            **(headers or {}),
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request_obj, timeout=20) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def get_json(url, token):
+    request_obj = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "secure-kyc-portal",
+        },
+    )
+    with urllib.request.urlopen(request_obj, timeout=20) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def first_value(data, keys):
+    for key in keys:
+        value = data.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def save_base64_image(raw_value, prefix):
+    if not raw_value:
+        return None
+
+    value = str(raw_value)
+    extension = "jpg"
+    if value.startswith("data:image/"):
+        header, value = value.split(",", 1)
+        extension = header.split("/")[1].split(";")[0] or "jpg"
+
+    try:
+        image_bytes = base64.b64decode(value)
+    except Exception:
+        return None
+
+    save_path = upload_path(prefix, f"digilocker_photo.{extension}")
+    with open(save_path, "wb") as file:
+        file.write(image_bytes)
+
+    if cv2.imread(save_path) is None:
+        return None
+    return save_path
+
+
+def normalize_digilocker_profile(profile):
+    aadhaar_number = first_value(profile, ["aadhaar_number", "aadhaar", "uid", "uid_number"])
+    aadhaar_last4 = first_value(profile, ["aadhaar_last4", "uid_last4"])
+    if aadhaar_number:
+        aadhaar_last4 = aadhaar_number[-4:]
+    masked_number = first_value(profile, ["masked_aadhaar", "masked_uid"])
+    if not masked_number and aadhaar_last4:
+        masked_number = f"XXXX XXXX {aadhaar_last4}"
+
+    photo_value = first_value(profile, ["photo", "picture", "photo_base64", "aadhaar_photo", "jpg_image"])
+    photo_path = save_base64_image(photo_value, "digilocker") if photo_value else None
+
+    return {
+        "name": first_value(profile, ["name", "full_name"]),
+        "dob": first_value(profile, ["dob", "date_of_birth", "birthdate"]),
+        "aadhaar_number": aadhaar_number or aadhaar_last4,
+        "aadhaar_last4": aadhaar_last4,
+        "masked_number": masked_number,
+        "photo_path": photo_path,
+        "raw_profile": profile,
+    }
+
+
+def github_primary_email(token):
+    try:
+        emails = get_json(OAUTH_PROVIDERS["github"]["emails_url"], token)
+    except (urllib.error.URLError, json.JSONDecodeError):
+        return None
+    for email in emails:
+        if email.get("primary") and email.get("verified"):
+            return email.get("email")
+    for email in emails:
+        if email.get("verified"):
+            return email.get("email")
+    return None
+
+
+def complete_login(provider, profile):
+    session.clear()
+    session["logged_in"] = True
+    session["login_provider"] = provider
+    session["login_user"] = profile.get("email") or profile.get("login") or profile.get("name") or provider
+    session["login_name"] = profile.get("name") or profile.get("login") or ""
+    return redirect("/")
+
+
+def complete_local_login(user):
+    session.clear()
+    session["logged_in"] = True
+    session["login_provider"] = "local"
+    session["login_user"] = user["email"]
+    session["login_name"] = user["name"]
+    session["login_user_id"] = user["id"]
+    return redirect("/")
+
+
+def login_error(message):
+    return redirect(f"/login?error_message={urllib.parse.quote(message)}")
 
 
 def mask_identifier(value):
@@ -121,7 +324,7 @@ MODERN_CSS = """
     h2 { color: #2d3748; margin-bottom: 10px; font-weight: 700; }
     p { color: #718096; font-size: 0.95rem; margin-bottom: 25px; }
     
-    input[type="text"], input[type="date"], input[type="file"] {
+    input[type="text"], input[type="date"], input[type="file"], input[type="password"] {
         width: 100%; padding: 12px; margin: 8px 0 20px 0;
         border: 2px solid #e2e8f0; border-radius: 10px; box-sizing: border-box; font-size: 1rem;
     }
@@ -153,6 +356,15 @@ MODERN_CSS = """
     .pill-warn { background:#fefcbf; color:#744210; }
     .pill-bad { background:#fed7d7; color:#9b2c2c; }
     .challenge { background:#ebf8ff; border:1px solid #bee3f8; color:#2b6cb0; padding:12px; border-radius:10px; font-weight:700; margin:14px 0; }
+    .top-link { display:block; text-align:right; color:#4a5568; text-decoration:none; font-size:0.86rem; font-weight:700; margin-bottom:8px; }
+    .error-message { background:#fed7d7; color:#9b2c2c; padding:10px 12px; border-radius:10px; font-weight:700; margin:0 0 18px 0; }
+    .oauth-grid { display:grid; gap:10px; margin:18px 0 8px 0; }
+    .oauth-btn { display:block; padding:12px 14px; border-radius:10px; border:1px solid #cbd5e0; color:#2d3748; text-decoration:none; font-weight:700; background:#fff; }
+    .oauth-btn:hover { background:#f7fafc; }
+    .divider { display:flex; align-items:center; gap:12px; color:#a0aec0; font-size:0.82rem; font-weight:700; margin:20px 0 14px 0; }
+    .divider:before, .divider:after { content:""; flex:1; height:1px; background:#e2e8f0; }
+    .auth-link { color:#486f99; text-decoration:none; font-weight:700; }
+    .helper-text { margin:16px 0 0 0; color:#4a5568; }
 
     /* LOADING SPINNER */
     .loader-overlay {
@@ -171,12 +383,280 @@ MODERN_CSS = """
 </style>
 """
 
+@app.route("/login", methods=["GET", "POST", "HEAD"])
+def login():
+    if request.method in {"GET", "HEAD"}:
+        error = request.args.get("error") == "1"
+        error_message = request.args.get("error_message")
+        success_message = request.args.get("success_message")
+        oauth_error = request.args.get("oauth_error")
+        error_html = "<div class='error-message'>Invalid username or password.</div>" if error else ""
+        if error_message:
+            error_html = f"<div class='error-message'>{escape(error_message)}</div>"
+        if success_message:
+            error_html = f"<div class='status-box' style='background:#c6f6d5; color:#276749; border:1px solid #9ae6b4; font-weight:700;'>{escape(success_message)}</div>"
+        if oauth_error:
+            error_html = f"<div class='error-message'>{escape(oauth_error)}</div>"
+        oauth_buttons = "<a class='oauth-btn' href='/oauth/google/start'>Continue with Google</a>"
+        if provider_is_configured("github"):
+            oauth_buttons += "<a class='oauth-btn' href='/oauth/github/start'>Continue with GitHub</a>"
+        return f"""
+        {MODERN_CSS}
+        <div class="card">
+            <h2>🔐 Secure KYC Login</h2>
+            <p>Sign in to access the verification portal.</p>
+            {error_html}
+            <div class="oauth-grid">
+                {oauth_buttons}
+            </div>
+            <div class="divider">OR</div>
+            <form method="post">
+                <label style="float:left; font-weight:600">Email</label>
+                <input name="username" type="text" autocomplete="email" required>
+
+                <label style="float:left; font-weight:600">Password</label>
+                <input name="password" type="password" autocomplete="current-password" required>
+
+                <button type="submit" class="btn">Login</button>
+            </form>
+            <p class="helper-text">New user? <a class="auth-link" href="/register">Create an account</a></p>
+        </div>
+        """
+
+    username = (request.form.get("username") or "").strip().lower()
+    password = request.form.get("password") or ""
+    user = find_user_by_email(username)
+    if user and check_password_hash(user["password_hash"], password):
+        return complete_local_login(user)
+
+    if secrets.compare_digest(username, LOGIN_USERNAME.lower()) and secrets.compare_digest(password, LOGIN_PASSWORD):
+        session.clear()
+        session["logged_in"] = True
+        session["login_provider"] = "admin"
+        session["login_user"] = username
+        return redirect("/")
+    return redirect("/login?error=1")
+
+
+@app.route("/register", methods=["GET", "POST", "HEAD"])
+def register():
+    if request.method in {"GET", "HEAD"}:
+        error_message = request.args.get("error_message")
+        success = request.args.get("success") == "1"
+        message_html = ""
+        if error_message:
+            message_html = f"<div class='error-message'>{escape(error_message)}</div>"
+        if success:
+            message_html = "<div class='status-box' style='background:#c6f6d5; color:#276749; border:1px solid #9ae6b4; font-weight:700;'>Account created. Please login.</div>"
+        return f"""
+        {MODERN_CSS}
+        <div class="card">
+            <h2>📝 Create Account</h2>
+            <p>Register to use Secure KYC without Google Sign-In.</p>
+            {message_html}
+            <form method="post">
+                <label style="float:left; font-weight:600">Full Name</label>
+                <input name="name" type="text" autocomplete="name" required>
+
+                <label style="float:left; font-weight:600">Email</label>
+                <input name="email" type="text" autocomplete="email" required>
+
+                <label style="float:left; font-weight:600">Password</label>
+                <input name="password" type="password" autocomplete="new-password" minlength="8" required>
+
+                <label style="float:left; font-weight:600">Confirm Password</label>
+                <input name="confirm_password" type="password" autocomplete="new-password" minlength="8" required>
+
+                <button type="submit" class="btn">Create Account</button>
+            </form>
+            <p class="helper-text">Already registered? <a class="auth-link" href="/login">Login</a></p>
+        </div>
+        """
+
+    name = (request.form.get("name") or "").strip()
+    email = (request.form.get("email") or "").strip().lower()
+    password = request.form.get("password") or ""
+    confirm_password = request.form.get("confirm_password") or ""
+
+    if not name:
+        return redirect(f"/register?error_message={urllib.parse.quote('Please enter your name.')}")
+    if "@" not in email or "." not in email:
+        return redirect(f"/register?error_message={urllib.parse.quote('Please enter a valid email address.')}")
+    if len(password) < 8:
+        return redirect(f"/register?error_message={urllib.parse.quote('Password must be at least 8 characters.')}")
+    if password != confirm_password:
+        return redirect(f"/register?error_message={urllib.parse.quote('Passwords do not match.')}")
+    if find_user_by_email(email):
+        return redirect(f"/register?error_message={urllib.parse.quote('An account already exists for this email. Please login.')}")
+
+    password_hash = generate_password_hash(password)
+    create_user(name, email, password_hash)
+    return redirect("/login?success_message=Account%20created.%20Please%20login.")
+
+
+@app.route("/oauth/<provider>/start")
+def oauth_start(provider):
+    config = get_provider(provider)
+    if not config:
+        return redirect("/login?oauth_error=Unsupported%20login%20provider.")
+    if not provider_is_configured(provider):
+        return redirect(f"/login?oauth_error={urllib.parse.quote(config['label'] + ' login is not configured yet.')}")
+
+    state = secrets.token_urlsafe(24)
+    session["oauth_state"] = state
+    session["oauth_provider"] = provider
+    params = {
+        "client_id": config["client_id"],
+        "redirect_uri": callback_url(provider),
+        "response_type": "code",
+        "scope": config["scope"],
+        "state": state,
+    }
+    if provider == "google":
+        params["prompt"] = "select_account"
+    return redirect(f"{config['auth_url']}?{urllib.parse.urlencode(params)}")
+
+
+@app.route("/oauth/<provider>/callback")
+def oauth_callback(provider):
+    config = get_provider(provider)
+    expected_state = session.get("oauth_state")
+    expected_provider = session.get("oauth_provider")
+    received_state = request.args.get("state")
+    code = request.args.get("code")
+    if not config or expected_provider != provider or not expected_state or not secrets.compare_digest(expected_state, received_state or ""):
+        return redirect("/login?oauth_error=Login%20session%20expired.%20Please%20try%20again.")
+    if not code:
+        return redirect("/login?oauth_error=Login%20was%20cancelled%20or%20failed.")
+
+    try:
+        token_response = post_form_json(config["token_url"], {
+            "client_id": config["client_id"],
+            "client_secret": config["client_secret"],
+            "code": code,
+            "redirect_uri": callback_url(provider),
+            "grant_type": "authorization_code",
+        })
+        access_token = token_response.get("access_token")
+        if not access_token:
+            return redirect("/login?oauth_error=Could%20not%20get%20login%20token.")
+
+        profile = get_json(config["userinfo_url"], access_token)
+        if provider == "github" and not profile.get("email"):
+            profile["email"] = github_primary_email(access_token)
+        return complete_login(provider, profile)
+    except (urllib.error.URLError, json.JSONDecodeError) as error:
+        return redirect(f"/login?oauth_error={urllib.parse.quote('OAuth login failed: ' + str(error))}")
+
+
+@app.route("/digilocker/start")
+def digilocker_start():
+    login_redirect = require_login()
+    if login_redirect:
+        return login_redirect
+    if "user" not in session:
+        return redirect("/")
+    if not digilocker_is_configured():
+        return redirect("/upload?digilocker_error=1")
+
+    state = secrets.token_urlsafe(24)
+    session["digilocker_state"] = state
+    params = {
+        "client_id": DIGILOCKER_CLIENT_ID,
+        "redirect_uri": digilocker_callback_url(),
+        "response_type": "code",
+        "scope": DIGILOCKER_SCOPE,
+        "state": state,
+    }
+    return redirect(f"{DIGILOCKER_AUTH_URL}?{urllib.parse.urlencode(params)}")
+
+
+@app.route("/digilocker/callback")
+def digilocker_callback():
+    login_redirect = require_login()
+    if login_redirect:
+        return login_redirect
+
+    expected_state = session.get("digilocker_state")
+    received_state = request.args.get("state")
+    code = request.args.get("code")
+    if not expected_state or not secrets.compare_digest(expected_state, received_state or ""):
+        return redirect("/upload?digilocker_error=session")
+    if not code:
+        return redirect("/upload?digilocker_error=cancelled")
+
+    try:
+        token_response = post_form_json(DIGILOCKER_TOKEN_URL, {
+            "client_id": DIGILOCKER_CLIENT_ID,
+            "client_secret": DIGILOCKER_CLIENT_SECRET,
+            "code": code,
+            "redirect_uri": digilocker_callback_url(),
+            "grant_type": "authorization_code",
+        })
+        access_token = token_response.get("access_token")
+        if not access_token:
+            return redirect("/upload?digilocker_error=token")
+
+        profile = {}
+        if DIGILOCKER_PROFILE_URL:
+            profile = get_json(DIGILOCKER_PROFILE_URL, access_token)
+        normalized = normalize_digilocker_profile(profile)
+        user = session.get("user", {})
+
+        if normalized.get("aadhaar_last4") and normalized["aadhaar_last4"] != user.get("aadhaar_last4"):
+            return redirect("/upload?digilocker_error=mismatch")
+
+        session["ocr_aadhaar"] = {
+            "status": "DIGILOCKER_VERIFIED",
+            "aadhaar_number": normalized.get("aadhaar_number") or user.get("aadhaar_last4"),
+            "masked_number": normalized.get("masked_number") or mask_identifier(user.get("aadhaar_last4")),
+            "full_text": "Identity data fetched from DigiLocker.",
+        }
+        session["ocr_pan"] = {"status": "SKIPPED", "pan_number": None}
+        session["digilocker_kyc"] = {
+            "name": normalized.get("name"),
+            "dob": normalized.get("dob"),
+            "aadhaar_masked": session["ocr_aadhaar"]["masked_number"],
+            "verified": True,
+        }
+
+        if normalized.get("photo_path"):
+            session["doc_path_for_face"] = normalized["photo_path"]
+            return redirect("/face-verify")
+
+        return f"""
+        {MODERN_CSS}
+        <div class="card">
+            {stepper(2)}
+            <h2>DigiLocker Connected</h2>
+            <p>Your identity data was fetched, but no face photo was returned by the configured DigiLocker profile endpoint.</p>
+            <div class="status-box" style="background:#fefcbf; border:1px solid #faf089;">
+                Upload an Aadhaar image once so the app has an ID face to compare with live capture.
+            </div>
+            <a href="/upload" class="btn" style="display:inline-block; text-decoration:none;">Upload ID Photo</a>
+        </div>
+        """
+    except (urllib.error.URLError, json.JSONDecodeError) as error:
+        return redirect(f"/upload?digilocker_error={urllib.parse.quote(str(error))}")
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/login")
+
+
 @app.route("/", methods=["GET", "POST", "HEAD"])
 def home():
+    login_redirect = require_login()
+    if login_redirect:
+        return login_redirect
+
     if request.method in {"GET", "HEAD"}:
         return f"""
         {MODERN_CSS}
         <div class="card">
+            <a class="top-link" href="/logout">Logout</a>
             {stepper(1)}
             <h2>🔐 Secure KYC Portal</h2>
             <p>Identity Verification System</p>
@@ -216,9 +696,24 @@ def home():
 
 @app.route("/upload", methods=["GET", "POST"])
 def upload():
+    login_redirect = require_login()
+    if login_redirect:
+        return login_redirect
     if "user" not in session: return redirect("/")
     
     if request.method == "GET":
+        digilocker_error = request.args.get("digilocker_error")
+        digilocker_error_html = ""
+        if digilocker_error:
+            messages = {
+                "1": "DigiLocker is not configured yet. Add client ID, client secret, auth URL, and token URL.",
+                "session": "DigiLocker session expired. Please try again.",
+                "cancelled": "DigiLocker authorization was cancelled.",
+                "token": "DigiLocker did not return an access token.",
+                "mismatch": "DigiLocker Aadhaar details do not match the last 4 digits you entered.",
+            }
+            message = messages.get(digilocker_error, f"DigiLocker failed: {digilocker_error}")
+            digilocker_error_html = f"<div class='error-message'>{escape(message)}</div>"
         return f"""
         {MODERN_CSS}
         
@@ -237,9 +732,13 @@ def upload():
         </script>
 
         <div class="card">
+            <a class="top-link" href="/logout">Logout</a>
             {stepper(2)}
             <h2>📂 Upload Documents</h2>
-            <p>Accepted: JPG, PNG, PDF</p>
+            <p>Use DigiLocker for official KYC, or upload documents manually.</p>
+            {digilocker_error_html}
+            <a href="/digilocker/start" class="oauth-btn" style="margin-bottom:16px;">Fetch KYC from DigiLocker</a>
+            <div class="divider">OR UPLOAD</div>
             <form method="post" enctype="multipart/form-data" onsubmit="showLoader()">
                 <label style="float:left; font-weight:600">Aadhaar Card (Front)</label>
                 <input type="file" name="aadhaar" accept="image/*,application/pdf" required>
@@ -330,6 +829,9 @@ def upload():
 
 @app.route("/face-verify", methods=["GET"])
 def face_verify_page():
+    login_redirect = require_login()
+    if login_redirect:
+        return login_redirect
     if "doc_path_for_face" not in session: return redirect("/")
     challenges = [
         "Look straight and blink once before capturing.",
@@ -349,6 +851,7 @@ def face_verify_page():
     </div>
 
     <div class="card" style="max-width: 600px;">
+        <a class="top-link" href="/logout">Logout</a>
         {stepper(3)}
         <h2>📸 User Verification</h2>
         <p>Choose how you want to verify your identity.</p>
@@ -481,6 +984,9 @@ def face_verify_page():
 
 @app.route("/process-face", methods=["POST"])
 def process_face():
+    login_redirect = require_login()
+    if login_redirect:
+        return login_redirect
     if "doc_path_for_face" not in session: return redirect("/")
 
     img_live = None
@@ -576,6 +1082,7 @@ def process_face():
     return f"""
     {MODERN_CSS}
     <div class="card" style="max-width:550px;">
+        <a class="top-link" href="/logout">Logout</a>
         {stepper(4)}
         <h2 style="color:{header_color}">{status_header}</h2>
         <p>Verification Complete ({escape(source_type or 'photo').title()} Method)</p>

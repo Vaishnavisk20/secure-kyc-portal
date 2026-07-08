@@ -42,6 +42,48 @@ def init_db():
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL
+            )
+            """
+        )
+
+
+def create_user(name, email, password_hash):
+    init_db()
+    with get_connection() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO users (created_at, name, email, password_hash)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(),
+                name,
+                email,
+                password_hash,
+            ),
+        )
+        return cursor.lastrowid
+
+
+def find_user_by_email(email):
+    init_db()
+    with get_connection() as connection:
+        return connection.execute(
+            """
+            SELECT id, created_at, name, email, password_hash
+            FROM users
+            WHERE lower(email) = lower(?)
+            """,
+            (email,),
+        ).fetchone()
 
 
 def create_kyc_record(user, ocr_aadhaar, ocr_pan, face_result, document_path, source_type, liveness_completed):

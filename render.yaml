@@ -10,11 +10,37 @@ services:
         generateValue: true
       - key: KYC_DEBUG
         value: "0"
+      - key: KYC_LOGIN_USERNAME
+        value: admin
+      - key: KYC_LOGIN_PASSWORD
+        value: admin123
+      - key: KYC_PUBLIC_URL
+        value: https://secure-kyc-portal.onrender.com
+      - key: KYC_GOOGLE_CLIENT_ID
+        sync: false
+      - key: KYC_GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: KYC_GITHUB_CLIENT_ID
+        sync: false
+      - key: KYC_GITHUB_CLIENT_SECRET
+        sync: false
+      - key: KYC_DIGILOCKER_CLIENT_ID
+        sync: false
+      - key: KYC_DIGILOCKER_CLIENT_SECRET
+        sync: false
+      - key: KYC_DIGILOCKER_AUTH_URL
+        sync: false
+      - key: KYC_DIGILOCKER_TOKEN_URL
+        sync: false
+      - key: KYC_DIGILOCKER_PROFILE_URL
+        sync: false
+      - key: KYC_DIGILOCKER_SCOPE
+        value: openid profile
       - key: KYC_FACE_MODEL
         value: ArcFace
       - key: KYC_FACE_DETECTOR
         value: retinaface
-      - key: KYC_FACE_APPROVE_THRESHOLD
-        value: "0.75"
-      - key: KYC_FACE_MANUAL_THRESHOLD
-        value: "0.90"
+      - key: KYC_FACE_APPROVE_SCORE
+        value: "70"
+      - key: KYC_FACE_MANUAL_SCORE
+        value: "50"
