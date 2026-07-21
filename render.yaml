@@ -36,6 +36,14 @@ services:
         sync: false
       - key: KYC_DIGILOCKER_SCOPE
         value: openid profile
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        value: https://apmrjwvyegqpvzsohojm.supabase.co
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_STORAGE_BUCKET
+        value: kyc-uploads
       - key: KYC_FACE_MODEL
         value: ArcFace
       - key: KYC_FACE_DETECTOR

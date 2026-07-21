@@ -10,7 +10,7 @@ import urllib.parse
 import urllib.request
 import numpy as np
 import fitz  # PyMuPDF for PDF handling
-from flask import Flask, request, session, redirect, jsonify, url_for
+from flask import Flask, request, session, redirect, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
@@ -18,7 +18,16 @@ from werkzeug.utils import secure_filename
 # Ensure you have services/ocr_service.py and services/face_service.py
 from services.ocr_service import extract_aadhaar_text, extract_pan_text
 from services.face_service import verify_face_match
-from services.db_service import create_kyc_record, create_user, find_user_by_email, init_db
+from services.liveness_service import verify_liveness
+from services.db_service import (
+    DB_BACKEND,
+    create_kyc_record,
+    create_uploaded_file_record,
+    create_user,
+    find_user_by_email,
+    init_db,
+)
+from services.storage_service import persist_upload
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("KYC_SECRET_KEY", "secure-kyc-key-999")
@@ -185,6 +194,14 @@ def save_base64_image(raw_value, prefix):
     return save_path
 
 
+def decode_image_data_url(data_url):
+    if not data_url or "," not in data_url:
+        return None
+    encoded_data = data_url.split(",", 1)[1]
+    nparr = np.frombuffer(base64.b64decode(encoded_data), np.uint8)
+    return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+
 def normalize_digilocker_profile(profile):
     aadhaar_number = first_value(profile, ["aadhaar_number", "aadhaar", "uid", "uid_number"])
     aadhaar_last4 = first_value(profile, ["aadhaar_last4", "uid_last4"])
@@ -297,6 +314,16 @@ def convert_pdf_to_image(file_storage, save_path):
         file_storage.save(save_path)
         return cv2.imread(save_path), save_path
 
+
+def session_upload_metadata():
+    return session.setdefault("upload_metadata", {})
+
+
+def persist_and_record_upload(local_path, kind, extra_metadata=None):
+    metadata = persist_upload(local_path, kind)
+    metadata["record_id"] = create_uploaded_file_record(metadata, extra_metadata)
+    return metadata
+
 # --- CSS STYLES (Modern UI + Loader) ---
 MODERN_CSS = """
 <style>
@@ -338,9 +365,41 @@ MODERN_CSS = """
     .btn:disabled { background: #cbd5e0; cursor: not-allowed; }
     
     .status-box { padding: 15px; border-radius: 10px; margin-top: 20px; text-align: left; }
-    .webcam-container { margin: 20px 0; width: 100%; max-width: 320px; border-radius: 12px; overflow: hidden; display: inline-block; position: relative; background: #000; }
+    .webcam-container { margin: 20px 0 10px 0; width: 100%; max-width: 360px; aspect-ratio: 1; border-radius: 12px; overflow: hidden; display: inline-block; position: relative; background: #000; }
     
-    video { width: 100%; height: auto; display: block; }
+    video { width: 100%; height: 100%; display: block; object-fit: cover; transform: scaleX(-1); }
+    .face-guide-shade {
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        background: radial-gradient(circle at center, transparent 0 36%, rgba(0, 0, 0, 0.58) 37% 100%);
+    }
+    .face-guide-ring {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        width: 72%;
+        aspect-ratio: 1;
+        transform: translate(-50%, -50%);
+        border: 3px solid #68d391;
+        border-radius: 50%;
+        box-shadow: 0 0 0 2px rgba(255,255,255,0.75), 0 0 18px rgba(104,211,145,0.55);
+        pointer-events: none;
+    }
+    .face-guide-label {
+        position: absolute;
+        left: 16px;
+        right: 16px;
+        bottom: 14px;
+        color: white;
+        background: rgba(26,32,44,0.72);
+        border-radius: 8px;
+        padding: 8px 10px;
+        font-weight: 700;
+        font-size: 0.82rem;
+        line-height: 1.25;
+        pointer-events: none;
+    }
 
     .tab-container { display: flex; justify-content: center; margin-bottom: 20px; gap: 10px; }
     .tab-btn { background: #e2e8f0; color: #4a5568; padding: 10px 20px; border-radius: 20px; cursor: pointer; border: none; font-weight: 600; }
@@ -778,6 +837,11 @@ def upload():
             errors.append(f"❌ Aadhaar Mismatch: Found ...{ocr_aadhaar['aadhaar_number'][-4:]}")
             
         session["doc_path_for_face"] = real_path_a
+        session_upload_metadata()["aadhaar"] = persist_and_record_upload(
+            real_path_a,
+            "aadhaar",
+            {"filename": f_aadhaar.filename, "step": "document_upload"},
+        )
 
     except Exception as e:
         errors.append(f"❌ Error processing Aadhaar: {str(e)}")
@@ -795,7 +859,12 @@ def upload():
             save_path_p = upload_path("pan", f_pan.filename)
         try:
             if save_path_p:
-                img_p, _ = convert_pdf_to_image(f_pan, save_path_p)
+                img_p, real_path_p = convert_pdf_to_image(f_pan, save_path_p)
+                session_upload_metadata()["pan"] = persist_and_record_upload(
+                    real_path_p,
+                    "pan",
+                    {"filename": f_pan.filename, "step": "document_upload"},
+                )
                 if img_p is None:
                     errors.append("❌ Could not read PAN image.")
                 else:
@@ -834,8 +903,8 @@ def face_verify_page():
         return login_redirect
     if "doc_path_for_face" not in session: return redirect("/")
     challenges = [
-        "Look straight and blink once before capturing.",
         "Turn your head slightly left, then face the camera.",
+        "Turn your head slightly right, then face the camera.",
         "Raise your chin slightly, then face the camera.",
     ]
     challenge = challenges[int(time.time()) % len(challenges)]
@@ -865,10 +934,13 @@ def face_verify_page():
         <div id="section-camera">
             <div class="webcam-container">
                 <video id="video" autoplay playsinline></video>
+                <div class="face-guide-shade"></div>
+                <div class="face-guide-ring"></div>
+                <div class="face-guide-label">Keep your face inside the circle</div>
                 <canvas id="canvas" style="display:none;"></canvas>
             </div>
             <p id="status" style="font-weight:bold; color:#2b6cb0;">Waiting for camera...</p>
-            <button id="capture-btn" class="btn" onclick="captureAndVerify()">Verify with Camera</button>
+            <button id="capture-btn" class="btn" onclick="captureAndVerify()">Run Live Capture</button>
         </div>
 
         <div id="section-upload" style="display:none;">
@@ -877,8 +949,8 @@ def face_verify_page():
                     <label style="float:none;">Upload Your Selfie/Photo</label>
                     <input type="file" name="user_photo" accept="image/*" required>
                     <input type="hidden" name="source_type" value="upload">
-                    <input type="hidden" name="liveness_ack" value="yes">
-                    <p style="margin:0 0 12px 0; color:#4a5568;">Use a recent, front-facing photo after doing the liveness prompt.</p>
+                    <input type="hidden" name="liveness_ack" value="no">
+                    <p style="margin:0 0 12px 0; color:#4a5568;">Uploaded photos skip live liveness and may be sent to manual review.</p>
                     <button type="submit" class="btn" style="background: #4a5568;">Verify Uploaded Photo</button>
                 </form>
             </div>
@@ -886,6 +958,7 @@ def face_verify_page():
 
         <form id="face-form-cam" method="post" action="/process-face" style="display:none;">
             <input type="hidden" name="image_data" id="image-data">
+            <input type="hidden" name="liveness_frames" id="liveness-frames">
             <input type="hidden" name="source_type" value="webcam">
             <input type="hidden" name="liveness_ack" id="liveness-ack" value="no">
         </form>
@@ -929,7 +1002,7 @@ def face_verify_page():
                     }});
                     
                     video.srcObject = stream;
-                    statusText.innerText = "Camera Active. Stay still.";
+                    statusText.innerText = "Camera active. Center your face inside the circle, then follow the prompt.";
                     statusText.style.color = "green";
                     captureBtn.disabled = false;
                 }} catch (err) {{
@@ -952,23 +1025,56 @@ def face_verify_page():
                 }}
             }}
 
-            function captureAndVerify() {{
-                if (!stream) return;
-                if (!confirm("Did you complete the liveness prompt shown on the page?")) return;
-                
+            function captureFrame() {{
                 const context = canvas.getContext('2d');
-                canvas.width = video.videoWidth;
-                canvas.height = video.videoHeight;
-                context.drawImage(video, 0, 0);
-                
-                const dataURL = canvas.toDataURL('image/jpeg', 0.8);
-                document.getElementById('image-data').value = dataURL;
+                const sourceWidth = video.videoWidth;
+                const sourceHeight = video.videoHeight;
+                const cropSize = Math.floor(Math.min(sourceWidth, sourceHeight) * 0.72);
+                const sourceX = Math.floor((sourceWidth - cropSize) / 2);
+                const sourceY = Math.floor((sourceHeight - cropSize) / 2);
+                canvas.width = 360;
+                canvas.height = 360;
+                context.save();
+                context.translate(canvas.width, 0);
+                context.scale(-1, 1);
+                context.drawImage(
+                    video,
+                    sourceX,
+                    sourceY,
+                    cropSize,
+                    cropSize,
+                    0,
+                    0,
+                    canvas.width,
+                    canvas.height
+                );
+                context.restore();
+                return canvas.toDataURL('image/jpeg', 0.82);
+            }}
+
+            function wait(ms) {{
+                return new Promise(resolve => setTimeout(resolve, ms));
+            }}
+
+            async function captureAndVerify() {{
+                if (!stream) return;
+                const captureBtn = document.getElementById('capture-btn');
+                const statusText = document.getElementById('status');
+                captureBtn.disabled = true;
+                statusText.innerText = "Keep your face in the circle. Follow the prompt now. Capturing live frames...";
+                statusText.style.color = "#2b6cb0";
+
+                const frames = [];
+                for (let i = 0; i < 5; i++) {{
+                    frames.push(captureFrame());
+                    await wait(450);
+                }}
+
+                document.getElementById('image-data').value = frames[frames.length - 1];
+                document.getElementById('liveness-frames').value = JSON.stringify(frames);
                 document.getElementById('liveness-ack').value = "yes";
 
-                // Show Loader
                 document.getElementById('loader').style.display = 'flex';
-                
-                // Submit Form
                 document.getElementById('face-form-cam').submit();
             }}
             
@@ -992,9 +1098,14 @@ def process_face():
     img_live = None
     source_type = request.form.get("source_type")
     liveness_ack = request.form.get("liveness_ack") == "yes"
+    liveness_result = {
+        "passed": False,
+        "status": "NOT_CHECKED",
+        "reason": "Live camera capture was not used.",
+    }
     saved_photo_path = None
 
-    if not liveness_ack:
+    if source_type == "webcam" and not liveness_ack:
         return "Liveness prompt was not completed. Please try again.", 400
     
     # --- HANDLE IMAGE SOURCE ---
@@ -1002,10 +1113,15 @@ def process_face():
         if source_type == "webcam":
             data_url = request.form.get("image_data")
             if not data_url: return "No image captured", 400
-            
-            encoded_data = data_url.split(',')[1]
-            nparr = np.frombuffer(base64.b64decode(encoded_data), np.uint8)
-            img_live = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            img_live = decode_image_data_url(data_url)
+            saved_photo_path = upload_path("selfie", "webcam.jpg")
+            cv2.imwrite(saved_photo_path, img_live)
+
+            frame_values = json.loads(request.form.get("liveness_frames") or "[]")
+            liveness_frames = [decode_image_data_url(frame) for frame in frame_values[:8]]
+            liveness_result = verify_liveness(liveness_frames)
+            if not liveness_result.get("passed"):
+                return f"Liveness check failed: {liveness_result.get('reason')}", 400
 
         elif source_type == "upload":
             f_photo = request.files.get("user_photo")
@@ -1025,6 +1141,16 @@ def process_face():
     if img_live.shape[0] < 80 or img_live.shape[1] < 80:
         return "Photo is too small or unreadable. Please upload a clearer selfie.", 400
 
+    selfie_upload = (
+        persist_and_record_upload(
+            saved_photo_path,
+            "selfie",
+            {"source_type": source_type, "step": "face_upload"},
+        )
+        if saved_photo_path
+        else {}
+    )
+
     # Load ID Card Image
     img_doc_path = session["doc_path_for_face"]
     img_doc = cv2.imread(img_doc_path)
@@ -1039,6 +1165,12 @@ def process_face():
     finally:
         if saved_photo_path and os.path.exists(saved_photo_path):
             os.remove(saved_photo_path)
+
+    face_result["liveness"] = liveness_result
+    if source_type != "webcam" and face_result.get("decision") == "APPROVED":
+        face_result["decision"] = "MANUAL_REVIEW"
+        face_result["match"] = False
+        face_result["error"] = "Live camera liveness is required for automatic approval."
     
     # Prepare Result Page
     decision = face_result.get("decision", "REJECTED")
@@ -1058,8 +1190,14 @@ def process_face():
         face_result=face_result,
         document_path=img_doc_path,
         source_type=source_type,
-        liveness_completed=liveness_ack,
+        liveness_completed=bool(liveness_result.get("passed")),
+        upload_metadata={
+            **session.get("upload_metadata", {}),
+            "selfie": selfie_upload,
+        },
     )
+    liveness_pill = "pill-ok" if liveness_result.get("passed") else "pill-warn"
+    liveness_label = liveness_result.get("status", "NOT_CHECKED").replace("_", " ")
     debug_html = ""
     if DEBUG_KYC:
         debug_html = f"""
@@ -1067,6 +1205,7 @@ def process_face():
             <h3 style="margin-top:0;">Debug Details</h3>
             <div class="debug-box">
                 Database record ID: {escape(record_id)}<br>
+                Database backend: {escape(DB_BACKEND)}<br>
                 Decision: {escape(decision)}<br>
                 Face distance: {escape(face_result.get('distance'))}<br>
                 Similarity score: {escape(face_result.get('score'))}%<br>
@@ -1074,6 +1213,11 @@ def process_face():
                 Detector: {escape(face_result.get('detector'))}<br>
                 Candidate: {escape(face_result.get('candidate'))}<br>
                 Orientation: {escape(face_result.get('orientation'))}<br>
+                Liveness frames: {escape(liveness_result.get('frames'))}<br>
+                Liveness face frames: {escape(liveness_result.get('face_frames'))}<br>
+                Liveness blur: {escape(liveness_result.get('blur_score'))}<br>
+                Liveness motion: {escape(liveness_result.get('motion_score'))}<br>
+                Liveness face shift: {escape(liveness_result.get('face_shift'))}<br>
                 OCR sample: {compact_debug_text(ocr_aadhaar.get('full_text'))}
             </div>
         </div>
@@ -1093,7 +1237,8 @@ def process_face():
             
             <p><strong>Status:</strong> <span class="pill {face_pill}">{escape(decision.replace('_', ' '))}</span></p>
             <p><strong>Similarity Score:</strong> {face_result['score']}%</p>
-            <p><strong>Liveness:</strong> <span class="pill pill-ok">Prompt Completed</span></p>
+            <p><strong>Liveness:</strong> <span class="pill {liveness_pill}">{escape(liveness_label)}</span></p>
+            <p style="font-size:0.85rem; color:#718096"><i>{escape(liveness_result.get('reason'))}</i></p>
             <p style="font-size:0.85rem; color:#718096"><i>{face_result.get('error') or 'Identity Confirmed'}</i></p>
         </div>
         
@@ -1115,4 +1260,4 @@ def process_face():
 
 if __name__ == "__main__":
     # Host='0.0.0.0' makes it accessible on network (e.g. from phone)
-    app.run(debug=True, port=5000, host='0.0.0.0')
+    app.run(debug=True, port=5000, host='0.0.0.0', use_reloader=False)

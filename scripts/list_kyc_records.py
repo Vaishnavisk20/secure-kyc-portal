@@ -1,6 +1,5 @@
 import json
 import os
-import sqlite3
 import sys
 
 
@@ -8,13 +7,12 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from services.db_service import DB_PATH, init_db
+from services.db_service import get_connection, init_db
 
 
 def main():
     init_db()
-    with sqlite3.connect(DB_PATH) as connection:
-        connection.row_factory = sqlite3.Row
+    with get_connection() as connection:
         rows = connection.execute(
             """
             SELECT
@@ -24,6 +22,12 @@ def main():
                 dob,
                 aadhaar_masked,
                 pan_masked,
+                aadhaar_document_path,
+                aadhaar_storage_path,
+                pan_document_path,
+                pan_storage_path,
+                selfie_path,
+                selfie_storage_path,
                 decision,
                 face_score,
                 face_distance,
@@ -38,7 +42,7 @@ def main():
             """
         ).fetchall()
 
-    print(json.dumps([dict(row) for row in rows], indent=2))
+    print(json.dumps([dict(row) for row in rows], indent=2, default=str))
     return 0
 
 

@@ -1,31 +1,29 @@
 # Aadhaar & PAN KYC  (Flask)
 
-An end-to-end KYC flow supporting both Aadhaar and PAN cards: user details form, document upload + OCR, live selfie + face match, and risk assessment with rule-based decision (approve / manual / reject).
+An end-to-end KYC flow supporting account login, Aadhaar/PAN document OCR, webcam liveness, face matching, and database-backed KYC decisions.
 
 ## What it does
-- Collects Name, DOB, Aadhaar last 4, and contact (phone/email for OTP).
-- OTP verification (mock-only; OTP is displayed on the page).
-- Aadhaar upload → preprocess → OCR (EasyOCR) → heuristics (keywords, number, DOB).
-- Live selfie capture in browser → face match against Aadhaar photo using DeepFace (RetinaFace + ArcFace, cosine similarity).
-- Decision rules: hard rejects on mismatched DOB/last4, low face similarity, missing Aadhaar cues; manual review for weak matches; approve on strong signals.
+- Supports Google login, local email/password registration, and admin fallback login.
+- Collects Name, DOB, Aadhaar last 4, and optional PAN.
+- Aadhaar/PAN upload -> local Tesseract OCR -> document-number matching.
+- Optional DigiLocker OAuth handoff when official credentials and endpoints are configured.
+- Live webcam capture -> OpenCV liveness checks -> DeepFace face match against the ID photo.
+- Stores completed KYC results in Supabase/Postgres when configured, with SQLite as the local fallback.
 
 ## Current thresholds & rules
 - Aadhaar last4: if provided and mismatched → reject; if provided but not detected → reject.
 - PAN number: if provided and mismatched → reject; if provided but not detected → reject.
-- DOB: if provided and mismatched → reject; if provided but missing in OCR → reject.
-- Name: fuzzy score < 50 → reject; < 70 → manual; else OK.
 - Face: similarity score >= 70 → approve; >= 50 → manual review; below 50 → reject.
-- OCR status: must be `CONFIRMED` to auto-pass; otherwise manual.
-- Risk score: > 0.7 → reject; > 0.5 → manual; else OK.
+- Webcam liveness: requires multiple camera frames, face detection, image sharpness, and small real motion.
+- Uploaded selfie/photo: can still be checked, but it cannot receive automatic approval without live liveness.
 
 ## Tech stack
 - Flask (API + inline UI)
-- OCR.Space API for cloud-based OCR (requires API key)
-- OpenCV for image preprocessing
+- Tesseract OCR via `pytesseract`
+- OpenCV for image processing and liveness checks
 - DeepFace (ArcFace model + RetinaFace detector) for face matching
-- RapidFuzz for name similarity
-- Scikit-learn for risk modeling
 - NumPy/TensorFlow/Keras backend via DeepFace
+- Supabase/Postgres or local SQLite for users and KYC records
 
 ## Setup & run
 1) Install Python 3.11+.
@@ -42,23 +40,21 @@ An end-to-end KYC flow supporting both Aadhaar and PAN cards: user details form,
    - Login: `admin` / `admin123` by default.
    - Page 1: Enter user details (Name, DOB, Aadhaar last4, PAN number).
    - Page 2: Upload Aadhaar and PAN documents.
-   - Page 3: Capture live selfie for face verification.
-   - Results: View KYC decision and risk assessment.
+   - Page 3: Capture live selfie for liveness + face verification.
+   - Results: View KYC decision.
 
 ## Environment notes
-- OTP is forced to mock: code is returned in `/otp/start` response and shown in UI.
 - Model weights (DeepFace backends) download on first use; allow network on first run.
 - To quiet TensorFlow logs, set `TF_CPP_MIN_LOG_LEVEL=2`.
 
 ## File map
 - `app.py` – Multi-page routes, inline UI, decision logic.
 - `services/face_service.py` – DeepFace verification with ArcFace, RetinaFace, orientation handling, and ID face crops.
+- `services/liveness_service.py` – OpenCV webcam liveness checks across multiple frames.
 - `services/ocr_service.py` – OCR + document heuristics (Aadhaar/PAN status, DOB, numbers).
-- `services/image_preprocess.py` – Simple preprocessing/cropping.
-- `services/aadhaar_validator.py` – Aadhaar number validation/masking.
-- `services/pan_validator.py` – PAN number validation.
-- `services/risk_model.py` – Risk scoring (ML model or heuristic fallback).
-- `ml/train_model.py` – Risk model training script.
+- `services/db_service.py` – Supabase/Postgres or SQLite tables for users and KYC records.
+- `scripts/kyc_smoke_test.py` – Local OCR/face verification smoke test helper.
+- `scripts/list_kyc_records.py` – Prints recent KYC records from the configured database.
 - `requirements.txt` – Dependencies.
 
 ## Notes on performance
@@ -88,6 +84,35 @@ Open `http://localhost:5000`.
 3. Render will use `render.yaml` and the `Dockerfile`.
 4. Use at least the Standard plan; TensorFlow + DeepFace can exceed small free-tier memory limits.
 
+### Supabase Database
+
+The app uses local SQLite by default at `data/kyc_records.db`. To use Supabase instead, set a Supabase Postgres connection string in either `DATABASE_URL` or `SUPABASE_DB_URL`.
+
+Use the Supabase dashboard's Postgres connection string, usually in this shape:
+
+```bash
+DATABASE_URL="postgresql://postgres:[YOUR-PASSWORD]@db.[PROJECT-REF].supabase.co:5432/postgres?sslmode=require"
+```
+
+Then reinstall dependencies and run the app:
+
+```bash
+pip install -r requirements.txt
+python app.py
+```
+
+On startup, the app creates the `users` and `kyc_records` tables in Supabase if they do not exist.
+
+To upload Aadhaar, PAN, and selfie files to Supabase Storage as well, create a private bucket named `kyc-uploads` in Supabase Storage and set:
+
+```bash
+SUPABASE_URL="https://apmrjwvyegqpvzsohojm.supabase.co"
+SUPABASE_SERVICE_ROLE_KEY="[YOUR-SERVICE-ROLE-KEY]"
+SUPABASE_STORAGE_BUCKET="kyc-uploads"
+```
+
+KYC records will include `aadhaar_document_path`, `aadhaar_storage_path`, `pan_document_path`, `pan_storage_path`, `selfie_path`, `selfie_storage_path`, and `upload_metadata`.
+
 ### Environment Variables
 
 Copy `.env.example` and set production values:
@@ -103,7 +128,12 @@ Copy `.env.example` and set production values:
 - `KYC_DIGILOCKER_AUTH_URL` / `KYC_DIGILOCKER_TOKEN_URL` - DigiLocker OAuth URLs assigned to your app.
 - `KYC_DIGILOCKER_PROFILE_URL` - optional DigiLocker profile/eKYC endpoint used to fetch verified identity fields.
 - `KYC_DIGILOCKER_SCOPE` - DigiLocker OAuth scopes, defaults to `openid profile`.
-- `KYC_DB_PATH` - SQLite database location.
+- `DATABASE_URL` - Supabase/Postgres connection URL; when set, this is used instead of SQLite.
+- `SUPABASE_DB_URL` - alternative Supabase/Postgres connection URL name.
+- `SUPABASE_URL` - Supabase project URL, used for Storage uploads.
+- `SUPABASE_SERVICE_ROLE_KEY` - Supabase service role key, used server-side for private Storage uploads.
+- `SUPABASE_STORAGE_BUCKET` - Supabase Storage bucket name, defaults to `kyc-uploads`.
+- `KYC_DB_PATH` - SQLite database location, only used when no Postgres URL is configured.
 - `KYC_UPLOAD_FOLDER` - uploaded document location.
 - `KYC_FACE_MODEL` - defaults to `ArcFace`.
 - `KYC_FACE_DETECTOR` - defaults to `retinaface`.
@@ -131,28 +161,7 @@ If the configured DigiLocker profile response includes a base64 face photo in fi
 
 ### Persistence Warning
 
-SQLite files and uploaded documents may be lost on hosts with ephemeral disks. For real production, use managed Postgres/S3-style storage and encrypt sensitive files.
-
-## ML Model & Training
-
-- The repository now includes a small example training script at `ml/train_model.py` and a placeholder model artifact at `ml/risk_model.pkl`.
-
-- Purpose: `services/risk_model.py` will attempt to load `ml/risk_model.pkl` at startup. If the file is missing the service falls back to a rule-based heuristic implementation (this is intentional and safe for development).
-
-- The provided `ml/train_model.py` generates synthetic training data, trains a small RandomForest classifier, and saves the artifact to `ml/risk_model.pkl`. This placeholder model is intended for local testing and demonstration only.
-
-### How to retrain a production model
-
-1. Replace the synthetic data generator in `ml/train_model.py` with your labeled KYC dataset. The expected feature order used by `services/risk_model.py` is:
-
-   - `face_pct` (0-100)
-   - `name_pct` (0-100)
-   - `verhoeff_flag` (0 or 1)
-   - `blur_score` (numeric)
-
-2. Train and save a scikit-learn compatible estimator with `joblib.dump()` to `ml/risk_model.pkl`.
-
-3. Restart the Flask app; `services/risk_model.py` will automatically load the model if present.
+SQLite files and uploaded documents may be lost on hosts with ephemeral disks. For real production, use Supabase/Postgres plus S3-style storage and encrypt sensitive files.
 
 ### Quick commands (local)
 
@@ -160,15 +169,12 @@ SQLite files and uploaded documents may be lost on hosts with ephemeral disks. F
 # Install deps
 pip install -r requirements.txt
 
-# Train and save placeholder model (creates ml/risk_model.pkl)
-python ml/train_model.py
-
 # Run the app
 python app.py
 ```
 
 ### Security & production notes
 
-- Do NOT commit real production model artifacts containing sensitive training data. Use an artifacts store (S3, Artifactory, MLflow) and fetch the model during deploy.
-- The example model here is synthetic and for local testing only. Replace with a properly validated, versioned model before using in production.
-- Logging, model versioning, and monitoring should be added when moving to production (CI, model registry, A/B testing and rollback).
+- Do not commit real user uploads, Aadhaar/PAN images, SQLite production data, OAuth secrets, or Google/DigiLocker client secrets.
+- For production, move from local SQLite/uploads to managed database and object storage with encryption.
+- Add audit logging, admin review screens, and stricter liveness/anti-spoofing before using this for real onboarding.
